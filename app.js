@@ -21,32 +21,41 @@ const userRouter = require("./routes/user.js");
 
 const dbUrl = process.env.ATLASDB_URL;
 
-main()
-    .then(() => console.log("connected to database"))
-    .catch(err => console.log(err));
+// ── DB Connection — cached for Vercel serverless warm reuse ──────────────────
+let connectionPromise = null;
 
-async function main() {
-    await mongoose.connect(dbUrl);
+function connectDB() {
+    if (mongoose.connection.readyState === 1) return Promise.resolve(); // already connected
+    if (connectionPromise) return connectionPromise;
+    connectionPromise = mongoose.connect(dbUrl, {
+        serverSelectionTimeoutMS: 10000,
+        socketTimeoutMS: 45000,
+    }).then(() => {
+        console.log("connected to database");
+    }).catch(err => {
+        console.error("DB connection error:", err.message);
+        connectionPromise = null;
+        throw err;
+    });
+    return connectionPromise;
 }
 
+// ── Express config ────────────────────────────────────────────────────────────
 app.set("view engine", "ejs");
 app.set("views", path.join(__dirname, "views"));
 app.use(express.urlencoded({ extended: true }));
 app.use(methodOverride("_method"));
 app.engine('ejs', ejsMate);
-app.use(express.static(path.join(__dirname, "/public")));
+app.use(express.static(path.join(__dirname, "public")));
 
+// ── Session & Auth ────────────────────────────────────────────────────────────
 const store = MongoStore.create({
     mongoUrl: dbUrl,
-    crypto: {
-        secret: process.env.SECRET,
-    },
+    crypto: { secret: process.env.SECRET },
     touchAfter: 24 * 60 * 60,
 });
 
-store.on("error", (err) => {
-    console.log("error in mongo session store", err);
-});
+store.on("error", (err) => console.error("Session store error:", err));
 
 const sessionOptions = {
     store,
@@ -56,13 +65,11 @@ const sessionOptions = {
     cookie: {
         maxAge: 7 * 24 * 60 * 60 * 1000,
         httpOnly: true,
-        // secure: true,  // uncomment if your deployment uses HTTPS (recommended for production)
     }
 };
 
 app.use(session(sessionOptions));
 app.use(flash());
-
 app.use(passport.initialize());
 app.use(passport.session());
 passport.use(new LocalStrategy(User.authenticate()));
@@ -76,24 +83,37 @@ app.use((req, res, next) => {
     next();
 });
 
+// ── Root redirect (no DB needed) ─────────────────────────────────────────────
+app.get("/", (req, res) => res.redirect("/listings"));
+
+// ── DB connect middleware — runs before any data route ───────────────────────
+app.use(async (req, res, next) => {
+    try {
+        await connectDB();
+        next();
+    } catch (err) {
+        next(new ExpressError(500, "Could not connect to database. Please try again in a moment."));
+    }
+});
+
+// ── Routes ────────────────────────────────────────────────────────────────────
 app.use("/listings", listingRouter);
 app.use("/listings/:id/reviews", reviewRouter);
 app.use("/", userRouter);
 
+// ── 404 & Global error handler ────────────────────────────────────────────────
 app.all(/(.*)/, (req, res, next) => {
     next(new ExpressError(404, "Page not found"));
 });
 
 app.use((err, req, res, next) => {
-    let { statusCode = 400, message } = err;
+    let { statusCode = 500, message = "Something went wrong!" } = err;
     res.status(statusCode).render("listings/error.ejs", { message });
 });
 
-// Only call app.listen when running locally — Vercel uses the exported app
+// ── Local dev only ────────────────────────────────────────────────────────────
 if (process.env.NODE_ENV !== "production") {
-    app.listen(8080, () => {
-        console.log("server is listening to port 8080");
-    });
+    app.listen(8080, () => console.log("server is listening to port 8080"));
 }
 
 module.exports = app;
